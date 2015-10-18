@@ -70,6 +70,8 @@ typedef struct
 	bool isagg;
 	int ngroupatts;
 	AttrNumber *groupatts;
+	FmgrInfo *eq_funcs;
+	FmgrInfo *hash_funcs;
 	Oid *groupops;
 	FuncExpr *hashfunc;
 	GroupCache *cache;
@@ -416,7 +418,7 @@ select_existing_groups(ContQueryCombinerState *state)
 			NULL);
 
 	dest = CreateDestReceiver(DestTupleTable);
-	SetTupleTableDestReceiverParams(dest, existing, state->state_cxt, true);
+	SetTupleTableDestReceiverParams(dest, existing, existing->tablecxt, true);
 
 	PortalStart(portal, NULL, EXEC_FLAG_COMBINE_LOOKUP, NULL);
 
@@ -465,6 +467,33 @@ finish:
 	hash_destroy(batchgroups->hashtab);
 }
 
+/*
+ * reset_existing_hashtable
+ *
+ * Free any memory associated with the given state's existing hashtable and
+ * create a new hashtable.
+ */
+static TupleHashTable
+build_existing_hashtable(ContQueryCombinerState *state)
+{
+	MemoryContext existing_cxt = AllocSetContextCreate(state->combine_cxt, "CombinerExistingGroupsCxt",
+			ALLOCSET_DEFAULT_MINSIZE,
+			ALLOCSET_DEFAULT_INITSIZE,
+			ALLOCSET_DEFAULT_MAXSIZE);
+	MemoryContext existing_tmp_cxt = AllocSetContextCreate(existing_cxt, "CombinerExistingGroupsTmpCxt",
+			ALLOCSET_DEFAULT_MINSIZE,
+			ALLOCSET_DEFAULT_INITSIZE,
+			ALLOCSET_DEFAULT_MAXSIZE);
+	MemoryContext old = MemoryContextSwitchTo(state->combine_cxt);
+	TupleHashTable result;
+
+	result = BuildTupleHashTable(state->ngroupatts, state->groupatts, state->eq_funcs, state->hash_funcs, 1000,
+			sizeof(HeapTupleEntryData), existing_cxt, existing_tmp_cxt);
+
+	MemoryContextSwitchTo(old);
+
+	return result;
+}
 
 /*
  * sync_combine
@@ -476,8 +505,6 @@ static void
 sync_combine(ContQueryCombinerState *state)
 {
 	TupleHashTable existing = state->existing;
-	HASH_SEQ_STATUS iter;
-	HeapTupleEntry entry;
 	TupleTableSlot *slot = state->slot;
 	Size size = sizeof(bool) * slot->tts_tupleDescriptor->natts;
 	bool *replace_all = palloc0(size);
@@ -546,22 +573,13 @@ sync_combine(ContQueryCombinerState *state)
 
 	list_free(tuples_to_cache);
 
-	if (existing)
-	{
-		hash_seq_init(&iter, existing->hashtab);
-		while ((entry = (HeapTupleEntry) hash_seq_search(&iter)) != NULL)
-		{
-			ExecStoreTuple(entry->tuple, slot, InvalidBuffer, false);
-			RemoveTupleHashEntry(existing, slot);
-			heap_freetuple(entry->tuple);
-		}
-
-		MemoryContextResetAndDeleteChildren(existing->tempcxt);
-	}
-
 	tuplestore_clear(state->batch);
 	tuplestore_clear(state->combined);
+	MemoryContextResetAndDeleteChildren(state->combine_cxt);
 	MemSet(group_hashes, 0, continuous_query_batch_size * sizeof(int64));
+
+	if (existing)
+		state->existing = build_existing_hashtable(state);
 
 	FreeExecutorState(estate);
 }
@@ -598,7 +616,7 @@ combine(ContQueryCombinerState *state)
 					  NULL);
 
 	dest = CreateDestReceiver(DestTuplestore);
-	SetTuplestoreDestReceiverParams(dest, state->combined, state->state_cxt, true);
+	SetTuplestoreDestReceiverParams(dest, state->combined, state->combine_cxt, true);
 
 	PortalStart(portal, NULL, EXEC_FLAG_COMBINE, NULL);
 
@@ -650,6 +668,10 @@ init_query_state(ContQueryCombinerState *state, Oid id, MemoryContext context)
 			ALLOCSET_DEFAULT_MINSIZE,
 			ALLOCSET_DEFAULT_INITSIZE,
 			ALLOCSET_DEFAULT_MAXSIZE);
+	state->combine_cxt = AllocSetContextCreate(context, "CombinerQueryCacheTmpCxt",
+			ALLOCSET_DEFAULT_MINSIZE,
+			ALLOCSET_DEFAULT_INITSIZE,
+			ALLOCSET_DEFAULT_MAXSIZE);
 
 	state->view = GetContinuousView(id);
 
@@ -671,25 +693,11 @@ init_query_state(ContQueryCombinerState *state, Oid id, MemoryContext context)
 		Agg *agg = (Agg *) state->combine_plan->planTree;
 		Relation matrel;
 		ResultRelInfo *ri;
-		FmgrInfo *eq_funcs;
-		FmgrInfo *hash_funcs;
-		MemoryContext existing_cxt = AllocSetContextCreate(state_cxt, "CombinerExistingGroupsCxt",
-				ALLOCSET_DEFAULT_MINSIZE,
-				ALLOCSET_DEFAULT_INITSIZE,
-				ALLOCSET_DEFAULT_MAXSIZE);
-		MemoryContext existing_tmp_cxt = AllocSetContextCreate(state_cxt, "CombinerExistingGroupsTmpCxt",
-				ALLOCSET_DEFAULT_MINSIZE,
-				ALLOCSET_DEFAULT_INITSIZE,
-				ALLOCSET_DEFAULT_MAXSIZE);
 
 		state->groupatts = agg->grpColIdx;
 		state->ngroupatts = agg->numCols;
 		state->groupops = agg->grpOperators;
 		state->isagg = true;
-
-		execTuplesHashPrepare(state->ngroupatts, state->groupops, &eq_funcs, &hash_funcs);
-		state->existing = BuildTupleHashTable(state->ngroupatts, state->groupatts, eq_funcs, hash_funcs, 1000,
-				sizeof(HeapTupleEntryData), existing_cxt, existing_tmp_cxt);
 
 		matrel = heap_openrv_extended(state->view->matrel, AccessShareLock, true);
 
@@ -706,6 +714,9 @@ init_query_state(ContQueryCombinerState *state, Oid id, MemoryContext context)
 
 		CQMatRelClose(ri);
 		heap_close(matrel, AccessShareLock);
+
+		execTuplesHashPrepare(state->ngroupatts, state->groupops, &state->eq_funcs, &state->hash_funcs);
+		state->existing = build_existing_hashtable(state);
 
 //		state->cache = GroupCacheCreate(continuous_query_combiner_cache_mem * 1024, state->ngroupatts, state->groupatts,
 //				state->groupops, state->slot, state_cxt, cache_tmp_cxt);
