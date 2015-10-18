@@ -1116,7 +1116,7 @@ next:
 
 			MemoryContextResetAndDeleteChildren(combine_cxt);
 			MemSet(group_hashes, 0, continuous_query_batch_size * sizeof(int64));
-			last_sync = GetCurrentTimestamp();
+//			last_sync = GetCurrentTimestamp();
 		}
 
 		pgstat_report_stat(false);
