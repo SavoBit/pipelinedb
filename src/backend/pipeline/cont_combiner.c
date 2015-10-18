@@ -899,6 +899,10 @@ need_sync(ContQueryCombinerState **states, Bitmapset *queries, TimestampTz last_
 
 	Bitmapset *tmp = bms_copy(queries);
 	int id;
+
+	if (continuous_query_commit_interval <= 0)
+		return true;
+
 	while ((id = bms_first_member(tmp)) >= 0)
 	{
 		ContQueryCombinerState *state = states[id];
@@ -1107,7 +1111,6 @@ next:
 			debug_query_string = NULL;
 		}
 
-		//
 		if (need_sync(states, queries, last_sync))
 		{
 			sync_all(states, queries);
@@ -1116,7 +1119,7 @@ next:
 
 			MemoryContextResetAndDeleteChildren(combine_cxt);
 			MemSet(group_hashes, 0, continuous_query_batch_size * sizeof(int64));
-//			last_sync = GetCurrentTimestamp();
+			last_sync = GetCurrentTimestamp();
 		}
 
 		pgstat_report_stat(false);
