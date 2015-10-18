@@ -86,6 +86,8 @@ typedef struct
 static int64 *group_hashes = NULL;
 static int group_hashes_len = 0;
 
+static MemoryContext combine_cxt;
+
 static bool
 should_read_fn(TupleBufferReader *reader, TupleBufferSlot *slot)
 {
@@ -154,7 +156,7 @@ get_values(ContQueryCombinerState *state)
 		Const *hash;
 
 		/*
-		 * If the input est already has this group, we don't need to look it up
+		 * If the input set already has this group, we don't need to look it up
 		 */
 		if (LookupTupleHashEntry(existing, slot, NULL))
 		{
@@ -463,7 +465,6 @@ finish:
 	}
 
 	list_free(tups);
-
 	hash_destroy(batchgroups->hashtab);
 }
 
@@ -476,7 +477,7 @@ finish:
 static TupleHashTable
 build_existing_hashtable(ContQueryCombinerState *state)
 {
-	MemoryContext existing_cxt = AllocSetContextCreate(state->combine_cxt, "CombinerExistingGroupsCxt",
+	MemoryContext existing_cxt = AllocSetContextCreate(combine_cxt, "CombinerExistingGroupsCxt",
 			ALLOCSET_DEFAULT_MINSIZE,
 			ALLOCSET_DEFAULT_INITSIZE,
 			ALLOCSET_DEFAULT_MAXSIZE);
@@ -484,7 +485,7 @@ build_existing_hashtable(ContQueryCombinerState *state)
 			ALLOCSET_DEFAULT_MINSIZE,
 			ALLOCSET_DEFAULT_INITSIZE,
 			ALLOCSET_DEFAULT_MAXSIZE);
-	MemoryContext old = MemoryContextSwitchTo(state->combine_cxt);
+	MemoryContext old = MemoryContextSwitchTo(combine_cxt);
 	TupleHashTable result;
 
 	result = BuildTupleHashTable(state->ngroupatts, state->groupatts, state->eq_funcs, state->hash_funcs, 1000,
@@ -513,10 +514,17 @@ sync_combine(ContQueryCombinerState *state)
 	ListCell *lc;
 	int i;
 
+	state->matrel = heap_openrv_extended(state->view->matrel, RowExclusiveLock, true);
+
+	if (state->matrel == NULL)
+		return;
+
 	/* Only replace values for non-group attributes */
 	MemSet(replace_all, true, size);
 	for (i = 0; i < state->ngroupatts; i++)
 		replace_all[state->groupatts[i] - 1] = false;
+
+	state->ri = CQMatRelOpen(state->matrel);
 
 	foreach_tuple(slot, state->combined)
 	{
@@ -575,13 +583,30 @@ sync_combine(ContQueryCombinerState *state)
 
 	tuplestore_clear(state->batch);
 	tuplestore_clear(state->combined);
-	MemoryContextResetAndDeleteChildren(state->combine_cxt);
-	MemSet(group_hashes, 0, continuous_query_batch_size * sizeof(int64));
 
-	if (existing)
-		state->existing = build_existing_hashtable(state);
+	CQMatRelClose(state->ri);
+	heap_close(state->matrel, RowExclusiveLock);
+	state->matrel = NULL;
+	state->existing = NULL;
 
 	FreeExecutorState(estate);
+}
+
+/*
+ * sync_all
+ */
+static void
+sync_all(ContQueryCombinerState **states, Bitmapset *queries)
+{
+	Bitmapset *tmp = bms_copy(queries);
+	int id;
+	while ((id = bms_first_member(tmp)) >= 0)
+	{
+		ContQueryCombinerState *state = states[id];
+		if (!state)
+			continue;
+		sync_combine(state);
+	}
 }
 
 /*
@@ -600,10 +625,19 @@ combine(ContQueryCombinerState *state)
 	if (state->matrel == NULL)
 		return;
 
-	state->ri = CQMatRelOpen(state->matrel);
-
 	if (state->isagg)
+	{
+		if (state->existing == NULL)
+			state->existing = build_existing_hashtable(state);
+
 		select_existing_groups(state);
+	}
+
+	foreach_tuple(state->slot, state->combined)
+	{
+		tuplestore_puttupleslot(state->batch, state->slot);
+	}
+	tuplestore_clear(state->combined);
 
 	portal = CreatePortal("", true, true);
 	portal->visible = false;
@@ -616,7 +650,7 @@ combine(ContQueryCombinerState *state)
 					  NULL);
 
 	dest = CreateDestReceiver(DestTuplestore);
-	SetTuplestoreDestReceiverParams(dest, state->combined, state->combine_cxt, true);
+	SetTuplestoreDestReceiverParams(dest, state->combined, combine_cxt, true);
 
 	PortalStart(portal, NULL, EXEC_FLAG_COMBINE, NULL);
 
@@ -627,14 +661,10 @@ combine(ContQueryCombinerState *state)
 					 dest,
 					 NULL);
 
-	// if (needs_sync(state))
-	sync_combine(state);
+//	sync_combine(state);
+	heap_close(state->matrel, RowExclusiveLock);
 
 	PortalDrop(portal, false);
-
-	CQMatRelClose(state->ri);
-	heap_close(state->matrel, RowExclusiveLock);
-	state->matrel = NULL;
 }
 
 static void
@@ -665,10 +695,6 @@ init_query_state(ContQueryCombinerState *state, Oid id, MemoryContext context)
 			ALLOCSET_DEFAULT_INITSIZE,
 			ALLOCSET_DEFAULT_MAXSIZE);
 	cache_tmp_cxt = AllocSetContextCreate(state_cxt, "CombinerQueryCacheTmpCxt",
-			ALLOCSET_DEFAULT_MINSIZE,
-			ALLOCSET_DEFAULT_INITSIZE,
-			ALLOCSET_DEFAULT_MAXSIZE);
-	state->combine_cxt = AllocSetContextCreate(context, "CombinerQueryCacheTmpCxt",
 			ALLOCSET_DEFAULT_MINSIZE,
 			ALLOCSET_DEFAULT_INITSIZE,
 			ALLOCSET_DEFAULT_MAXSIZE);
@@ -829,6 +855,8 @@ read_batch(ContQueryCombinerState *state, TupleBufferBatchReader *reader)
 
 		ExecStoreTuple(heap_copytuple(tbs->tuple->heaptup), state->slot, InvalidBuffer, false);
 		tuplestore_puttupleslot(state->batch, state->slot);
+
+		// if count >= len, double the size
 		group_hashes[count] = tbs->tuple->group_hash;
 
 		IncrementCQRead(1, tbs->size);
@@ -860,6 +888,27 @@ has_queries_to_process(Bitmapset *queries)
 	return has_queries;
 }
 
+/*
+ * need_sync
+ */
+static bool
+need_sync(ContQueryCombinerState **states, Bitmapset *queries, TimestampTz last_sync)
+{
+	// if total memory usage over, true
+	// if time passed since last sync, true
+
+	Bitmapset *tmp = bms_copy(queries);
+	int id;
+	while ((id = bms_first_member(tmp)) >= 0)
+	{
+		ContQueryCombinerState *state = states[id];
+		if (!state)
+			continue;
+	}
+
+	return TimestampDifferenceExceeds(last_sync, GetCurrentTimestamp(), continuous_query_commit_interval);
+}
+
 void
 ContinuousQueryCombinerMain(void)
 {
@@ -875,6 +924,13 @@ ContinuousQueryCombinerMain(void)
 	TimestampTz last_processed = GetCurrentTimestamp();
 	bool has_queries;
 	int id;
+	TimestampTz last_sync = GetCurrentTimestamp();
+	bool in_xact = false;
+
+	combine_cxt =  AllocSetContextCreate(run_cxt, "CombinerCombineCxt",
+			ALLOCSET_DEFAULT_MINSIZE,
+			ALLOCSET_DEFAULT_INITSIZE,
+			ALLOCSET_DEFAULT_MAXSIZE);
 
 	/* Set the commit level */
 	synchronous_commit = continuous_query_combiner_synchronous_commit;
@@ -899,7 +955,6 @@ ContinuousQueryCombinerMain(void)
 	// or just repalloc and set new size (probably better)
 	group_hashes_len = continuous_query_batch_size;
 
-
 	group_hashes = palloc0(group_hashes_len * sizeof(int64));
 
 	for (;;)
@@ -909,7 +964,8 @@ ContinuousQueryCombinerMain(void)
 		int id;
 		bool updated_queries = false;
 
-		TupleBufferBatchReaderTrySleep(reader, last_processed);
+		if (!in_xact)
+			TupleBufferBatchReaderTrySleep(reader, last_processed);
 
 		if (MyContQueryProc->group->terminate)
 			break;
@@ -925,7 +981,7 @@ ContinuousQueryCombinerMain(void)
 		}
 
 		/* If we had no queries, then rescan the catalog. */
-		if (!has_queries)
+		if (!has_queries && !in_xact)
 		{
 			Bitmapset *new, *removed;
 			StartTransactionCommand();
@@ -945,7 +1001,11 @@ ContinuousQueryCombinerMain(void)
 			has_queries = has_queries_to_process(queries);
 		}
 
-		StartTransactionCommand();
+		if (!in_xact)
+		{
+			StartTransactionCommand();
+			in_xact = true;
+		}
 
 		MemoryContextSwitchTo(ContQueryBatchContext);
 
@@ -1047,7 +1107,18 @@ next:
 			debug_query_string = NULL;
 		}
 
-		CommitTransactionCommand();
+		//
+		if (need_sync(states, queries, last_sync))
+		{
+			sync_all(states, queries);
+			CommitTransactionCommand();
+			in_xact = false;
+
+			MemoryContextResetAndDeleteChildren(combine_cxt);
+			MemSet(group_hashes, 0, continuous_query_batch_size * sizeof(int64));
+			last_sync = GetCurrentTimestamp();
+		}
+
 		pgstat_report_stat(false);
 
 		if (num_processed)
@@ -1055,7 +1126,6 @@ next:
 
 		TupleBufferBatchReaderReset(reader);
 
-		// only do this after syncing
 		MemoryContextResetAndDeleteChildren(ContQueryBatchContext);
 	}
 
