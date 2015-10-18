@@ -416,7 +416,7 @@ select_existing_groups(ContQueryCombinerState *state)
 			NULL);
 
 	dest = CreateDestReceiver(DestTupleTable);
-	SetTupleTableDestReceiverParams(dest, existing, state->combine_cxt, true);
+	SetTupleTableDestReceiverParams(dest, existing, state->state_cxt, true);
 
 	PortalStart(portal, NULL, EXEC_FLAG_COMBINE_LOOKUP, NULL);
 
@@ -553,7 +553,10 @@ sync_combine(ContQueryCombinerState *state)
 		{
 			ExecStoreTuple(entry->tuple, slot, InvalidBuffer, false);
 			RemoveTupleHashEntry(existing, slot);
+			heap_freetuple(entry->tuple);
 		}
+
+		MemoryContextResetAndDeleteChildren(existing->tempcxt);
 	}
 
 	tuplestore_clear(state->batch);
@@ -595,7 +598,7 @@ combine(ContQueryCombinerState *state)
 					  NULL);
 
 	dest = CreateDestReceiver(DestTuplestore);
-	SetTuplestoreDestReceiverParams(dest, state->combined, state->combine_cxt, true);
+	SetTuplestoreDestReceiverParams(dest, state->combined, state->state_cxt, true);
 
 	PortalStart(portal, NULL, EXEC_FLAG_COMBINE, NULL);
 
@@ -606,7 +609,7 @@ combine(ContQueryCombinerState *state)
 					 dest,
 					 NULL);
 
-	// only if necessary
+	// if (needs_sync(state))
 	sync_combine(state);
 
 	PortalDrop(portal, false);
@@ -643,10 +646,6 @@ init_query_state(ContQueryCombinerState *state, Oid id, MemoryContext context)
 			ALLOCSET_DEFAULT_MINSIZE,
 			ALLOCSET_DEFAULT_INITSIZE,
 			ALLOCSET_DEFAULT_MAXSIZE);
-	state->combine_cxt = AllocSetContextCreate(state_cxt, "CombinerCombineCxt",
-			ALLOCSET_DEFAULT_MINSIZE,
-			ALLOCSET_DEFAULT_INITSIZE,
-			ALLOCSET_DEFAULT_MAXSIZE);
 	cache_tmp_cxt = AllocSetContextCreate(state_cxt, "CombinerQueryCacheTmpCxt",
 			ALLOCSET_DEFAULT_MINSIZE,
 			ALLOCSET_DEFAULT_INITSIZE,
@@ -660,10 +659,7 @@ init_query_state(ContQueryCombinerState *state, Oid id, MemoryContext context)
 	pstmt = GetContPlan(state->view, Combiner);
 
 	state->batch = tuplestore_begin_heap(true, true, continuous_query_combiner_work_mem);
-
-	old_cxt = MemoryContextSwitchTo(state->combine_cxt);
 	state->combined = tuplestore_begin_heap(false, false, continuous_query_combiner_work_mem);
-	MemoryContextSwitchTo(old_cxt);
 
 	/* this also sets the state's desc field */
 	prepare_combine_plan(state, pstmt);
@@ -677,6 +673,14 @@ init_query_state(ContQueryCombinerState *state, Oid id, MemoryContext context)
 		ResultRelInfo *ri;
 		FmgrInfo *eq_funcs;
 		FmgrInfo *hash_funcs;
+		MemoryContext existing_cxt = AllocSetContextCreate(state_cxt, "CombinerExistingGroupsCxt",
+				ALLOCSET_DEFAULT_MINSIZE,
+				ALLOCSET_DEFAULT_INITSIZE,
+				ALLOCSET_DEFAULT_MAXSIZE);
+		MemoryContext existing_tmp_cxt = AllocSetContextCreate(state_cxt, "CombinerExistingGroupsTmpCxt",
+				ALLOCSET_DEFAULT_MINSIZE,
+				ALLOCSET_DEFAULT_INITSIZE,
+				ALLOCSET_DEFAULT_MAXSIZE);
 
 		state->groupatts = agg->grpColIdx;
 		state->ngroupatts = agg->numCols;
@@ -685,7 +689,7 @@ init_query_state(ContQueryCombinerState *state, Oid id, MemoryContext context)
 
 		execTuplesHashPrepare(state->ngroupatts, state->groupops, &eq_funcs, &hash_funcs);
 		state->existing = BuildTupleHashTable(state->ngroupatts, state->groupatts, eq_funcs, hash_funcs, 1000,
-				sizeof(HeapTupleEntryData), state->combine_cxt, state->tmp_cxt);
+				sizeof(HeapTupleEntryData), existing_cxt, existing_tmp_cxt);
 
 		matrel = heap_openrv_extended(state->view->matrel, AccessShareLock, true);
 
@@ -962,7 +966,7 @@ ContinuousQueryCombinerMain(void)
 					continue;
 
 				debug_query_string = NameStr(state->view->name);
-				MemoryContextSwitchTo(state->combine_cxt);
+				MemoryContextSwitchTo(state->tmp_cxt);
 
 				TupleBufferBatchReaderSetCQId(reader, id);
 
@@ -974,7 +978,7 @@ ContinuousQueryCombinerMain(void)
 					combine(state);
 				}
 
-//				MemoryContextResetAndDeleteChildren(state->tmp_cxt);
+				MemoryContextResetAndDeleteChildren(state->tmp_cxt);
 
 				IncrementCQExecutions(1);
 			}
