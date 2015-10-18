@@ -73,6 +73,7 @@ int continuous_query_max_wait;
 int continuous_query_combiner_work_mem;
 int continuous_query_combiner_cache_mem;
 int continuous_query_combiner_synchronous_commit;
+int continuous_query_commit_interval;
 double continuous_query_proc_priority;
 
 /* memory context for long-lived data */

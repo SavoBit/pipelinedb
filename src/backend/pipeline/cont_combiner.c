@@ -878,7 +878,13 @@ ContinuousQueryCombinerMain(void)
 	has_queries = has_queries_to_process(queries);
 
 	MemoryContextSwitchTo(run_cxt);
+
+
+	// we need to commit if we fill this up
+	// or just repalloc and set new size (probably better)
 	group_hashes_len = continuous_query_batch_size;
+
+
 	group_hashes = palloc0(group_hashes_len * sizeof(int64));
 
 	for (;;)
