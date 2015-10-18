@@ -900,7 +900,7 @@ need_sync(ContQueryCombinerState **states, Bitmapset *queries, TimestampTz last_
 	Bitmapset *tmp = bms_copy(queries);
 	int id;
 
-	if (continuous_query_commit_interval <= 0)
+	if (synchronous_stream_insert || continuous_query_commit_interval <= 0)
 		return true;
 
 	while ((id = bms_first_member(tmp)) >= 0)
