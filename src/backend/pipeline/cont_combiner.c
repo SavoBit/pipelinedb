@@ -126,8 +126,9 @@ prepare_combine_plan(ContQueryCombinerState *state, PlannedStmt *plan)
  * group columns that can be joined against with the matrel's existing groups.
  */
 static List *
-get_values(ContQueryCombinerState *state, TupleHashTable existing)
+get_values(ContQueryCombinerState *state)
 {
+	TupleHashTable existing = state->existing;
 	TupleTableSlot *slot = state->slot;
 	List *values = NIL;
 	int pos = 0;
@@ -336,8 +337,9 @@ get_cached_groups_plan(ContQueryCombinerState *state, List *values)
  * by their grouping columns
  */
 static TupleHashTable
-hash_groups(ContQueryCombinerState *state, TupleHashTable existing)
+hash_groups(ContQueryCombinerState *state)
 {
+	TupleHashTable existing = state->existing;
 	TupleHashTable groups = NULL;
 	bool isnew = false;
 	TupleTableSlot *slot = state->slot;
@@ -380,7 +382,7 @@ select_existing_groups(ContQueryCombinerState *state)
 	List *tups = NIL;
 	ListCell *lc;
 	List *values = NIL;
-	TupleHashTable batchgroups = hash_groups(state, existing);
+	TupleHashTable batchgroups = hash_groups(state);
 
 	/*
 	 * If we're not grouping on any columns, then there's only one row to look up
@@ -388,7 +390,7 @@ select_existing_groups(ContQueryCombinerState *state)
 	 */
 	if (state->isagg && state->ngroupatts > 0)
 	{
-		values = get_values(state, existing);
+		values = get_values(state);
 		/*
 		 * If we're grouping and there aren't any uncached values to look up,
 		 * there is no need to execute a query.
@@ -580,24 +582,7 @@ combine(ContQueryCombinerState *state)
 	state->ri = CQMatRelOpen(state->matrel);
 
 	if (state->isagg)
-	{
-//		FmgrInfo *eq_funcs;
-//		FmgrInfo *hash_funcs;
-//
-//		// switch to combine context
-//		MemoryContext hash_tmp_cxt = AllocSetContextCreate(state->tmp_cxt, "CombinerQueryHashTableTempCxt",
-//				ALLOCSET_DEFAULT_MINSIZE,
-//				ALLOCSET_DEFAULT_INITSIZE,
-//				ALLOCSET_DEFAULT_MAXSIZE);
-//
-//		execTuplesHashPrepare(state->ngroupatts, state->groupops, &eq_funcs, &hash_funcs);
-//		state->existing = BuildTupleHashTable(state->ngroupatts, state->groupatts, eq_funcs, hash_funcs, 1000,
-//				sizeof(HeapTupleEntryData), CurrentMemoryContext, hash_tmp_cxt);
-
 		select_existing_groups(state);
-	}
-
-	// state->batch now has incoming and on-disk tuples
 
 	portal = CreatePortal("", true, true);
 	portal->visible = false;
@@ -623,14 +608,6 @@ combine(ContQueryCombinerState *state)
 
 	// only if necessary
 	sync_combine(state);
-
-	// never happens
-//	tuplestore_end(result);
-	// tuplestore_clear
-
-	// only after sync
-//	if (state->existing)
-//		hash_destroy(state->existing->hashtab);
 
 	PortalDrop(portal, false);
 
@@ -1123,7 +1100,8 @@ GetCombinerLookupPlan(ContinuousView *view)
 			heap_close(rel, AccessShareLock);
 		}
 
-		values = get_values(&state, existing);
+		state.existing = existing;
+		values = get_values(&state);
 	}
 
 	plan = get_cached_groups_plan(&state, values);
