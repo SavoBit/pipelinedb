@@ -80,6 +80,7 @@ typedef struct
 	CQStatEntry stats;
 	TupleHashTable existing;
 	Tuplestorestate *combined;
+	long pending_tuples;
 } ContQueryCombinerState;
 
 /* stores the hashes of the current batch, in parallel to the order of the batch's tuplestore */
@@ -360,6 +361,8 @@ hash_groups(ContQueryCombinerState *state)
 			existing->tab_eq_funcs, existing->tab_hash_funcs, 1000,
 			existing->entrysize, cxt, tmp_cxt);
 
+	tuplestore_rescan(state->batch);
+
 	foreach_tuple(slot, state->batch)
 		LookupTupleHashEntry(groups, slot, &isnew);
 
@@ -386,7 +389,7 @@ select_existing_groups(ContQueryCombinerState *state)
 	List *tups = NIL;
 	ListCell *lc;
 	List *values = NIL;
-	TupleHashTable batchgroups = hash_groups(state);
+	TupleHashTable batchgroups;
 
 	/*
 	 * If we're not grouping on any columns, then there's only one row to look up
@@ -401,6 +404,14 @@ select_existing_groups(ContQueryCombinerState *state)
 		 */
 		if (!values)
 			goto finish;
+	}
+	else if (state->isagg && state->ngroupatts == 0)
+	{
+		/*
+		 * If we only have one group and it's already in existing, we're done
+		 */
+		if (hash_get_num_entries(state->existing->hashtab))
+			return;
 	}
 
 	plan = get_cached_groups_plan(state, values);
@@ -433,6 +444,7 @@ select_existing_groups(ContQueryCombinerState *state)
 	PortalDrop(portal, false);
 
 finish:
+	batchgroups = hash_groups(state);
 	tuplestore_rescan(state->batch);
 	foreach_tuple(slot, state->batch)
 	{
@@ -581,14 +593,10 @@ sync_combine(ContQueryCombinerState *state)
 
 	list_free(tuples_to_cache);
 
-	tuplestore_clear(state->batch);
 	tuplestore_clear(state->combined);
 
 	CQMatRelClose(state->ri);
 	heap_close(state->matrel, RowExclusiveLock);
-	state->matrel = NULL;
-	state->existing = NULL;
-
 	FreeExecutorState(estate);
 }
 
@@ -605,7 +613,13 @@ sync_all(ContQueryCombinerState **states, Bitmapset *queries)
 		ContQueryCombinerState *state = states[id];
 		if (!state)
 			continue;
-		sync_combine(state);
+
+		if (state->pending_tuples > 0)
+			sync_combine(state);
+
+		state->pending_tuples = 0;
+		state->matrel = NULL;
+		state->existing = NULL;
 	}
 }
 
@@ -619,11 +633,6 @@ combine(ContQueryCombinerState *state)
 {
 	Portal portal;
 	DestReceiver *dest;
-
-	state->matrel = heap_openrv_extended(state->view->matrel, RowExclusiveLock, true);
-
-	if (state->matrel == NULL)
-		return;
 
 	if (state->isagg)
 	{
@@ -661,10 +670,8 @@ combine(ContQueryCombinerState *state)
 					 dest,
 					 NULL);
 
-//	sync_combine(state);
-	heap_close(state->matrel, RowExclusiveLock);
-
 	PortalDrop(portal, false);
+	tuplestore_clear(state->batch);
 }
 
 static void
@@ -877,11 +884,13 @@ has_queries_to_process(Bitmapset *queries)
 	bool has_queries = false;
 
 	while ((id = bms_first_member(tmp)) >= 0)
+	{
 		if (id % continuous_query_num_combiners == MyContQueryProc->group_id)
 		{
 			has_queries = true;
 			break;
 		}
+	}
 
 	bms_free(tmp);
 
@@ -892,23 +901,30 @@ has_queries_to_process(Bitmapset *queries)
  * need_sync
  */
 static bool
-need_sync(ContQueryCombinerState **states, Bitmapset *queries, TimestampTz last_sync)
+need_sync(ContQueryCombinerState **states, Bitmapset *queries, TimestampTz last_sync, long *num_pending)
 {
 	// if total memory usage over, true
 	// if time passed since last sync, true
 
 	Bitmapset *tmp = bms_copy(queries);
+	long pending = 0;
 	int id;
-
-	if (synchronous_stream_insert || continuous_query_commit_interval <= 0)
-		return true;
 
 	while ((id = bms_first_member(tmp)) >= 0)
 	{
 		ContQueryCombinerState *state = states[id];
-		if (!state)
+		if (state == NULL)
 			continue;
+		pending += state->pending_tuples;
 	}
+
+	*num_pending = pending;
+
+	if (pending == 0)
+		return false;
+
+	if (synchronous_stream_insert || continuous_query_commit_interval == 0)
+		return true;
 
 	return TimestampDifferenceExceeds(last_sync, GetCurrentTimestamp(), continuous_query_commit_interval);
 }
@@ -930,6 +946,8 @@ ContinuousQueryCombinerMain(void)
 	int id;
 	TimestampTz last_sync = GetCurrentTimestamp();
 	bool in_xact = false;
+	bool do_sync = false;
+	long total_pending = 0;
 
 	combine_cxt =  AllocSetContextCreate(run_cxt, "CombinerCombineCxt",
 			ALLOCSET_DEFAULT_MINSIZE,
@@ -1050,6 +1068,7 @@ ContinuousQueryCombinerMain(void)
 				if (count)
 				{
 					num_processed += count;
+					state->pending_tuples += count;
 					combine(state);
 				}
 
@@ -1111,7 +1130,10 @@ next:
 			debug_query_string = NULL;
 		}
 
-		if (need_sync(states, queries, last_sync))
+		pgstat_report_stat(false);
+
+		do_sync = need_sync(states, queries, last_sync, &total_pending);
+		if (do_sync)
 		{
 			sync_all(states, queries);
 			CommitTransactionCommand();
@@ -1121,11 +1143,13 @@ next:
 			MemSet(group_hashes, 0, continuous_query_batch_size * sizeof(int64));
 			last_sync = GetCurrentTimestamp();
 		}
+		else if (total_pending == 0)
+		{
+			CommitTransactionCommand();
+			in_xact = false;
+		}
 
-		pgstat_report_stat(false);
-
-		if (num_processed)
-			last_processed = GetCurrentTimestamp();
+		last_processed = GetCurrentTimestamp();
 
 		TupleBufferBatchReaderReset(reader);
 
