@@ -53,6 +53,12 @@
 
 #define GROUPS_PLAN_LIFESPAN (10 * 1000)
 
+/*
+ * Flag that indicates whether or not an on-disk tuple has already been added to
+ * an ongoing combine result.
+ */
+#define EXISTING_ADDED 0x1
+
 typedef struct
 {
 	Oid view_id;
@@ -460,6 +466,13 @@ finish:
 	while ((entry = (HeapTupleEntry) hash_seq_search(&status)) != NULL)
 	{
 		/*
+		 * We only need to add on-disk tuples to the input once, because they'll
+		 * be accumulated upon within the ongoing combine result until we sync.
+		 */
+		if (entry->flags & EXISTING_ADDED)
+			continue;
+
+		/*
 		 * Our index can potentially have collisions, so we filter out any
 		 * tuples that were returned that aren't related to the batch we're
 		 * currently processing. This is just a matter of intersecting the
@@ -467,7 +480,10 @@ finish:
 		 */
 		ExecStoreTuple(entry->tuple, slot, InvalidBuffer, false);
 		if (LookupTupleHashEntry(batchgroups, slot, NULL))
+		{
 			tuplestore_puttuple(state->batch, entry->tuple);
+			entry->flags |= EXISTING_ADDED;
+		}
 	}
 
 	foreach(lc, tups)
@@ -1159,7 +1175,8 @@ next:
 			in_xact = false;
 		}
 
-		last_processed = GetCurrentTimestamp();
+		if (num_processed)
+			last_processed = GetCurrentTimestamp();
 
 		TupleBufferBatchReaderReset(reader);
 
